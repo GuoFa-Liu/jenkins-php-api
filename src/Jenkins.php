@@ -2,6 +2,8 @@
 
 namespace JenkinsKhan;
 
+use JenkinsKhan\Jenkins\QueueReference;
+
 class Jenkins
 {
 
@@ -43,12 +45,20 @@ class Jenkins
      */
     private $crumbRequestField;
 
-    /**
-     * @param string $baseUrl
-     */
-    public function __construct($baseUrl)
+    private $basicAuthorizationHeader;
+
+    public function __construct($baseUrl, $username = null, $passwordOrToken = null)
     {
         $this->baseUrl = $baseUrl;
+
+        if(isset($username)){
+            $this->addAuthentication($username, $passwordOrToken);
+        }
+    }
+
+    private function addAuthentication($username, $passwordOrToken)
+    {
+        $this->basicAuthorizationHeader = "Authorization: Basic " . base64_encode($username . ":" . $passwordOrToken);
     }
 
     /**
@@ -99,6 +109,13 @@ class Jenkins
         $curl = curl_init($url);
 
         curl_setopt($curl, \CURLOPT_RETURNTRANSFER, 1);
+
+        $headers = array();
+        if ($this->basicAuthorizationHeader) {
+            $headers[] = $this->basicAuthorizationHeader;
+        }
+
+        curl_setopt($curl, \CURLOPT_HTTPHEADER, $headers);
 
         $ret = curl_exec($curl);
 
@@ -242,9 +259,9 @@ class Jenkins
     public function launchJob($jobName, $parameters = array())
     {
         if (0 === count($parameters)) {
-            $url = sprintf('%s/job/%s/build', $this->baseUrl, $jobName);
+            $url = sprintf('%s/%s/build', $this->baseUrl, $jobName);
         } else {
-            $url = sprintf('%s/job/%s/buildWithParameters', $this->baseUrl, $jobName);
+            $url = sprintf('%s/%s/buildWithParameters', $this->baseUrl, $jobName);
         }
 
         $curl = curl_init($url);
@@ -258,14 +275,132 @@ class Jenkins
             $headers[] = $this->getCrumbHeader();
         }
 
-        curl_setopt($curl, \CURLOPT_HTTPHEADER, $headers);
+        if ($this->basicAuthorizationHeader) {
+            $headers[] = $this->basicAuthorizationHeader;
+        }
 
-        curl_exec($curl);
+        curl_setopt($curl, \CURLOPT_HTTPHEADER, $headers);
+        curl_setopt($curl, \CURLOPT_RETURNTRANSFER, 1);
+        curl_setopt($curl, \CURLOPT_HEADER, 1);
+
+        $response = curl_exec($curl);
 
         $this->validateCurl($curl, sprintf('Error trying to launch job "%s" (%s)', $jobName, $url));
 
-        return true;
+        // build QueueReference
+        $responseHeaderSize = curl_getinfo($curl, CURLINFO_HEADER_SIZE);
+        $responseHeaders = $this->parseHttpResponseHeader(substr($response, 0, $responseHeaderSize));
+
+        return new QueueReference($responseHeaders['Location']);
+
     }
+
+    private function parseHttpResponseHeader($responseHeaderString)
+    {
+        $responseHeaders = array();
+        $headers = explode("\r\n", $responseHeaderString);
+        foreach ($headers as $v)
+        {
+            if(strpos($v,':') !== false){
+                $implodes = explode(":", $v, 2);
+                $responseHeaders[$implodes[0]] = trim($implodes[1]);
+            }
+        }
+        return $responseHeaders;
+    }
+
+    /**
+     * @param       $jobName
+     * @param array $parameters
+     *
+     * @return bool
+     * @internal param array $extraParameters
+     *
+     */
+    public function launchJobAndWaitUntilFinished($jobName, $parameters = array(), $callback = null)
+    {
+        $queueReference = $this->launchJob($jobName, $parameters);
+
+        if(!$queueReference->getLocation()){
+           return false;
+        }
+
+        $buildNumber = $this->getBuildNumber($queueReference);
+        if(!$buildNumber){
+            $buildNumber = $this->getBuildLastNumber($jobName);
+        }
+
+        $callback && $callback($buildNumber);
+
+        $buildDetail = $this->getBuildDetail($jobName, $buildNumber);
+
+        while (true){
+            if($buildDetail->isRunning()){
+                sleep(5);
+                $buildDetail = $this->getBuildDetail($jobName, $buildNumber);
+            }else{
+                break;
+            }
+        }
+
+        return $buildDetail;
+    }
+
+    public function getBuildNumber($queueReference)
+    {
+        $url  = sprintf('%sapi/json', $queueReference->getLocation());
+
+        $curl = curl_init($url);
+
+        curl_setopt($curl, \CURLOPT_RETURNTRANSFER, 1);
+
+        $headers = array();
+        if ($this->basicAuthorizationHeader) {
+            $headers[] = $this->basicAuthorizationHeader;
+        }
+
+        curl_setopt($curl, \CURLOPT_HTTPHEADER, $headers);
+
+        $ret = curl_exec($curl);
+
+        $this->validateCurl($curl, 'Error during getting build number on %s', $queueReference->getLocation());
+
+        $result = json_decode($ret);
+
+        if (!$result instanceof \stdClass) {
+            throw new \RuntimeException('Error during json_decode of csrf crumb');
+        }
+
+        if(!array_key_exists('executable', $result)){
+            sleep(1);
+            return $this->getBuildNumber($queueReference);
+        }
+
+        return $result->executable->number;
+    }
+
+    public function getBuildLastNumber($jobName)
+    {
+        $url = sprintf('%s/%s/lastBuild/buildNumber', $this->baseUrl, $jobName);
+
+        $curl = curl_init($url);
+
+        curl_setopt($curl, \CURLOPT_RETURNTRANSFER, 1);
+
+        $headers = array();
+        if ($this->basicAuthorizationHeader) {
+            $headers[] = $this->basicAuthorizationHeader;
+        }
+
+        curl_setopt($curl, \CURLOPT_HTTPHEADER, $headers);
+
+        $ret = curl_exec($curl);
+
+        $this->validateCurl($curl, 'Error during getting build last number for job %s on %s', $jobName, $this->baseUrl);
+
+        return $ret;
+    }
+
 
     /**
      * @param string $jobName
@@ -275,7 +410,7 @@ class Jenkins
      */
     public function getJob($jobName)
     {
-        $url  = sprintf('%s/job/%s/api/json', $this->baseUrl, $jobName);
+        $url  = sprintf('%s/%s/api/json', $this->baseUrl, $jobName);
         $curl = curl_init($url);
 
         curl_setopt($curl, \CURLOPT_RETURNTRANSFER, 1);
@@ -307,7 +442,7 @@ class Jenkins
      */
     public function deleteJob($jobName)
     {
-        $url  = sprintf('%s/job/%s/doDelete', $this->baseUrl, $jobName);
+        $url  = sprintf('%s/%s/doDelete', $this->baseUrl, $jobName);
         $curl = curl_init($url);
 
         curl_setopt($curl, \CURLOPT_RETURNTRANSFER, 1);
@@ -415,12 +550,12 @@ class Jenkins
      * @return Jenkins\Build
      * @throws \RuntimeException
      */
-    public function getBuild($job, $buildId, $tree = 'actions[parameters,parameters[name,value]],result,duration,timestamp,number,url,estimatedDuration,builtOn')
+    public function getBuildDetail($job, $buildId, $tree = 'actions[parameters,parameters[name,value]],result,duration,timestamp,number,url,estimatedDuration,builtOn')
     {
         if ($tree !== null) {
             $tree = sprintf('?tree=%s', $tree);
         }
-        $url  = sprintf('%s/job/%s/%d/api/json%s', $this->baseUrl, $job, $buildId, $tree);
+        $url  = sprintf('%s/%s/%d/api/json%s', $this->baseUrl, $job, $buildId, $tree);
         $curl = curl_init($url);
 
         curl_setopt($curl, \CURLOPT_RETURNTRANSFER, 1);
@@ -428,7 +563,7 @@ class Jenkins
 
         $this->validateCurl(
             $curl,
-            sprintf('Error during getting information for build %s#%d on %s', $job, $buildId, $this->baseUrl)
+            sprintf('Error during getting information for build detail %s#%d on %s', $job, $buildId, $this->baseUrl)
         );
 
         $infos = json_decode($ret);
@@ -450,7 +585,7 @@ class Jenkins
     {
         return (null === $buildId) ?
             $this->getUrlJob($job)
-            : sprintf('%s/job/%s/%d', $this->baseUrl, $job, $buildId);
+            : sprintf('%s/%s/%d', $this->baseUrl, $job, $buildId);
     }
 
     /**
@@ -496,7 +631,7 @@ class Jenkins
      */
     public function getUrlJob($job)
     {
-        return sprintf('%s/job/%s', $this->baseUrl, $job);
+        return sprintf('%s/%s', $this->baseUrl, $job);
     }
 
     /**
@@ -577,7 +712,7 @@ class Jenkins
      */
     public function setJobConfig($jobname, $configuration)
     {
-        $url  = sprintf('%s/job/%s/config.xml', $this->baseUrl, $jobname);
+        $url  = sprintf('%s/%s/config.xml', $this->baseUrl, $jobname);
         $curl = curl_init($url);
         curl_setopt($curl, \CURLOPT_POST, 1);
         curl_setopt($curl, \CURLOPT_POSTFIELDS, $configuration);
@@ -601,7 +736,7 @@ class Jenkins
      */
     public function getJobConfig($jobname)
     {
-        $url  = sprintf('%s/job/%s/config.xml', $this->baseUrl, $jobname);
+        $url  = sprintf('%s/%s/config.xml', $this->baseUrl, $jobname);
         $curl = curl_init($url);
         curl_setopt($curl, \CURLOPT_RETURNTRANSFER, 1);
         $ret = curl_exec($curl);
@@ -725,7 +860,17 @@ class Jenkins
      */
     public function getConsoleTextBuild($jobname, $buildNumber)
     {
-        $url  = sprintf('%s/job/%s/%s/consoleText', $this->baseUrl, $jobname, $buildNumber);
+        $url  = sprintf('%s/%s/%s/consoleText', $this->baseUrl, $jobname, $buildNumber);
+        $curl = curl_init($url);
+        curl_setopt($curl, \CURLOPT_RETURNTRANSFER, 1);
+
+        return curl_exec($curl);
+    }
+
+
+    public function getLogTextBuild($jobname, $buildNumber)
+    {
+        $url  = sprintf('%s/%s/%s/logText/progressiveText', $this->baseUrl, $jobname, $buildNumber);
         $curl = curl_init($url);
         curl_setopt($curl, \CURLOPT_RETURNTRANSFER, 1);
 
@@ -742,7 +887,7 @@ class Jenkins
      */
     public function getTestReport($jobName, $buildId)
     {
-        $url  = sprintf('%s/job/%s/%d/testReport/api/json', $this->baseUrl, $jobName, $buildId);
+        $url  = sprintf('%s/%s/%d/testReport/api/json', $this->baseUrl, $jobName, $buildId);
         $curl = curl_init($url);
 
         curl_setopt($curl, \CURLOPT_RETURNTRANSFER, 1);

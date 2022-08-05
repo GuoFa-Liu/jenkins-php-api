@@ -46,6 +46,13 @@ Get the color of the job
     //string(4) "blue"
 ```
 
+Launch a Job And With Until Finished
+------------
+```php
+    $job = $jenkins->launchJobAndWaitUntilFinished("clone-deploy");
+    var_dump($job);
+    // Jenkins\Build if successful or throws a RuntimeException
+```
 
 Launch a Job
 ------------

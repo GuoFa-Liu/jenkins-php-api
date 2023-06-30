@@ -251,17 +251,18 @@ class Jenkins
     /**
      * @param       $jobName
      * @param array $parameters
+     * @param       $delay
      *
      * @return bool
      * @internal param array $extraParameters
      *
      */
-    public function launchJob($jobName, $parameters = array())
+    public function launchJob($jobName, $parameters = array(), $delay = 0)
     {
         if (0 === count($parameters)) {
-            $url = sprintf('%s/%s/build', $this->baseUrl, $jobName);
+            $url = sprintf('%s/%s/build?delay=%dsec', $this->baseUrl, $jobName, $delay);
         } else {
-            $url = sprintf('%s/%s/buildWithParameters', $this->baseUrl, $jobName);
+            $url = sprintf('%s/%s/buildWithParameters?delay=%dsec', $this->baseUrl, $jobName, $delay);
         }
 
         $curl = curl_init($url);
@@ -326,9 +327,6 @@ class Jenkins
         }
 
         $buildNumber = $this->getBuildNumber($queueReference);
-        if(!$buildNumber){
-            $buildNumber = $this->getBuildLastNumber($jobName);
-        }
 
         $callback && $callback($buildNumber);
 
@@ -336,7 +334,7 @@ class Jenkins
 
         while (true){
             if($buildDetail->isRunning()){
-                sleep(5);
+                sleep(1);
                 $buildDetail = $this->getBuildDetail($jobName, $buildNumber);
             }else{
                 break;
@@ -371,7 +369,7 @@ class Jenkins
             throw new \RuntimeException('Error during json_decode of csrf crumb');
         }
 
-        if(!array_key_exists('executable', $result)){
+        if(!array_key_exists('executable', $result) || $result->executable === null){
             sleep(1);
             return $this->getBuildNumber($queueReference);
         }
